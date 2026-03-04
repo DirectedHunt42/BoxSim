@@ -2,6 +2,8 @@
 #include <vector>
 #include <cmath>
 #include <sstream>
+#include <string>
+#include <algorithm>
 
 #define GET_X_LPARAM(lp) ((int)(short)LOWORD(lp))
 #define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
@@ -12,11 +14,19 @@ struct Vec2 {
     Vec2 operator-(const Vec2& other) const { return Vec2(x - other.x, y - other.y); }
     Vec2 operator+(const Vec2& other) const { return Vec2(x + other.x, y + other.y); }
     Vec2 operator*(double s) const { return Vec2(x*s, y*s); }
+    Vec2 operator/(double s) const { return s != 0 ? Vec2(x/s, y/s) : Vec2(); }
     Vec2 operator-() const { return Vec2(-x, -y); }
     double dot(const Vec2& other) const { return x*other.x + y*other.y; }
     double cross(const Vec2& other) const { return x*other.y - y*other.x; }
     double length() const { return std::sqrt(x*x + y*y); }
     Vec2 normalized() const { double len = length(); return len > 0 ? *this * (1/len) : Vec2(); }
+    Vec2& operator+=(const Vec2& other) { x += other.x; y += other.y; return *this; }
+};
+
+struct Contact {
+    Vec2 force;
+    Vec2 point;
+    std::string label;
 };
 
 struct Box {
@@ -25,32 +35,40 @@ struct Box {
     double width, height;
     double x, y;
     double vx, vy;
-    double angle;
-    double angularVelocity;
-    double inertia;
+    std::string label;
+    std::vector<Contact> debugContacts;
 };
 
 std::vector<Box> boxes;
 double gravity = 9.81;
 double floorY = 550.0;
 double restitution = 0.6;
-double friction = 2.0;
+double mu_dynamic = 0.3;
+double mu_static = 0.3;
+double friction_threshold = 0.1;
+double spring_k = 5000.0;
+double damper_d = 0.0; // Will be set based on restitution
 bool paused = true;
 bool addBoxModeEnabled = false;
 int addingBox = 0;
 double tempX = 0, tempY = 0, tempW = 50, tempH = 50;
 int nextId = 1;
-bool showDebug = false;
+bool showVectors = false;
 
 const int WINDOW_WIDTH = 1000;
 const int WINDOW_HEIGHT = 600;
 const int BUTTON_HEIGHT = 50;
 
 HWND hwndPlayPause, hwndAdd, hwndClear, hwndDebug;
+HWND hwndGravityLabel, hwndGravityEdit, hwndFrictionLabel, hwndFrictionEdit, hwndElasticityLabel, hwndElasticityEdit, hwndApply;
 
 void addBox(double x, double y, double w, double h, double mass) {
     Box b{};
-    b.id = nextId++;
+    b.id = nextId;
+    int idx = nextId - 1;
+    char letter = 'A' + (idx % 26);
+    std::string suffix = (idx / 26 > 0) ? std::to_string(idx / 26) : "";
+    b.label = std::string(1, letter) + suffix;
     b.x = x;
     b.y = y;
     b.width = w;
@@ -58,276 +76,157 @@ void addBox(double x, double y, double w, double h, double mass) {
     b.mass = mass;
     b.vx = 0;
     b.vy = 0;
-    b.angle = 0;
-    b.angularVelocity = 0;
-    b.inertia = b.mass * (b.width * b.width + b.height * b.height) / 12.0;
     boxes.push_back(b);
-}
-
-bool checkCollision(const Box& b1, const Box& b2, Vec2& normal, double& depth, Vec2& contactPoint) {
-    // Get corners
-    Vec2 corners1[4], corners2[4];
-    double cos1 = std::cos(b1.angle), sin1 = std::sin(b1.angle);
-    double hw1 = b1.width * 0.5, hh1 = b1.height * 0.5;
-    double dxs[4] = {-hw1, hw1, hw1, -hw1};
-    double dys[4] = {-hh1, -hh1, hh1, hh1};
-    for (int i = 0; i < 4; ++i) {
-        double rx = dxs[i] * cos1 - dys[i] * sin1;
-        double ry = dxs[i] * sin1 + dys[i] * cos1;
-        corners1[i] = Vec2(b1.x + rx, b1.y + ry);
-    }
-    double cos2 = std::cos(b2.angle), sin2 = std::sin(b2.angle);
-    double hw2 = b2.width * 0.5, hh2 = b2.height * 0.5;
-    dxs[0] = -hw2; dxs[1] = hw2; dxs[2] = hw2; dxs[3] = -hw2;
-    dys[0] = -hh2; dys[1] = -hh2; dys[2] = hh2; dys[3] = hh2;
-    for (int i = 0; i < 4; ++i) {
-        double rx = dxs[i] * cos2 - dys[i] * sin2;
-        double ry = dxs[i] * sin2 + dys[i] * cos2;
-        corners2[i] = Vec2(b2.x + rx, b2.y + ry);
-    }
-
-    // Axes (normals)
-    Vec2 axes[4];
-    axes[0] = Vec2(-sin1, cos1);
-    axes[1] = Vec2(cos1, sin1);
-    axes[2] = Vec2(-sin2, cos2);
-    axes[3] = Vec2(cos2, sin2);
-
-    double minOverlap = 1e9;
-    Vec2 minAxis;
-    for (int i = 0; i < 4; ++i) {
-        Vec2 axis = axes[i].normalized(); // Already unit, but ensure
-        double min1 = 1e9, max1 = -1e9;
-        for (auto& c : corners1) {
-            double proj = c.dot(axis);
-            min1 = std::min(min1, proj);
-            max1 = std::max(max1, proj);
-        }
-        double min2 = 1e9, max2 = -1e9;
-        for (auto& c : corners2) {
-            double proj = c.dot(axis);
-            min2 = std::min(min2, proj);
-            max2 = std::max(max2, proj);
-        }
-        if (max1 < min2 || max2 < min1) return false;
-        double overlap = std::min(max1, max2) - std::max(min1, min2);
-        if (overlap < minOverlap) {
-            minOverlap = overlap;
-            minAxis = axis;
-        }
-    }
-
-    // Determine normal direction
-    Vec2 centerDiff = Vec2(b2.x - b1.x, b2.y - b1.y);
-    if (minAxis.dot(centerDiff) < 0) minAxis = -minAxis;
-    normal = minAxis;
-    depth = minOverlap;
-
-    // Approximate contact point using support points
-    Vec2 support1;
-    double maxProj1 = -1e9;
-    for (auto& c : corners1) {
-        double proj = c.dot(-normal);
-        if (proj > maxProj1) {
-            maxProj1 = proj;
-            support1 = c;
-        }
-    }
-    Vec2 support2;
-    double maxProj2 = -1e9;
-    for (auto& c : corners2) {
-        double proj = c.dot(normal);
-        if (proj > maxProj2) {
-            maxProj2 = proj;
-            support2 = c;
-        }
-    }
-    contactPoint = (support1 + support2) * 0.5;
-    return true;
+    nextId++;
 }
 
 void simulate(double dt) {
+    if (dt == 0) return;
+
     for (auto &b : boxes) {
-        b.vy += gravity * dt;
-        b.x += b.vx * dt;
-        b.y += b.vy * dt;
-        b.angle += b.angularVelocity * dt;
+        b.debugContacts.clear();
     }
 
-    // Handle wall and floor collisions for each box
-    for (auto &b : boxes) {
-        // Compute corners
-        Vec2 corners[4];
-        double cos_a = std::cos(b.angle), sin_a = std::sin(b.angle);
-        double hw = b.width * 0.5, hh = b.height * 0.5;
-        double dxs[4] = {-hw, hw, hw, -hw};
-        double dys[4] = {-hh, -hh, hh, hh};
-        for (int i = 0; i < 4; ++i) {
-            double rx = dxs[i] * cos_a - dys[i] * sin_a;
-            double ry = dxs[i] * sin_a + dys[i] * cos_a;
-            corners[i] = Vec2(b.x + rx, b.y + ry);
-        }
+    std::vector<Vec2> forces(boxes.size(), Vec2(0, 0));
 
+    // Gravity
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        Box &b = boxes[i];
+        forces[i].y += b.mass * gravity;
+        b.debugContacts.push_back({Vec2(0, b.mass * gravity), Vec2(b.x, b.y), "Gravity"});
+    }
+
+    // Floor and walls
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        Box &b = boxes[i];
         // Floor
-        bool floorCollided = false;
-        double maxY = -1e9;
-        Vec2 deepest;
-        for (auto& c : corners) {
-            if (c.y > maxY) {
-                maxY = c.y;
-                deepest = c;
-            }
-        }
-        if (maxY > floorY) {
-            floorCollided = true;
-            double depth = maxY - floorY;
-            Vec2 normal(0, -1);
-            Vec2 r = deepest - Vec2(b.x, b.y);
-            // Position correction
-            Vec2 sep = normal * depth;
-            b.x += sep.x;
-            b.y += sep.y;
-            // Velocity impulse
-            Vec2 perp_r(-r.y, r.x);
-            Vec2 v_at = Vec2(b.vx, b.vy) + perp_r * b.angularVelocity;
-            double vrn = v_at.dot(normal);
-            if (vrn < 0) {
-                double cross_rn = r.cross(normal);
-                double denom = 1.0 / b.mass + (cross_rn * cross_rn) / b.inertia;
-                if (denom > 0) {
-                    double j = - (1 + restitution) * vrn / denom;
-                    Vec2 impulse = normal * j;
-                    b.vx += impulse.x / b.mass;
-                    b.vy += impulse.y / b.mass;
-                    b.angularVelocity += r.cross(impulse) / b.inertia;
-                }
-            }
-        }
+        double bottom = b.y + b.height / 2.0;
+        if (bottom > floorY) {
+            double depth = bottom - floorY;
+            double vrn = b.vy;
+            double n_mag = spring_k * depth + damper_d * vrn;
+            if (n_mag < 0) n_mag = 0;
+            forces[i].y -= n_mag;
+            Vec2 contact(b.x, floorY);
+            b.debugContacts.push_back({Vec2(0, -n_mag), contact, "Normal from Floor"});
 
+            // Friction
+            if (n_mag > 0) {
+                double mu = (std::abs(b.vx) < friction_threshold) ? mu_static : mu_dynamic;
+                double f_max = mu * n_mag;
+                double accel_x = forces[i].x / b.mass; // tangential accel from other forces
+                double f_needed = -b.vx / dt - accel_x; // to keep vx=0 next step
+                double f_fric = 0;
+                if (std::abs(b.vx) < friction_threshold && std::abs(f_needed) < f_max) {
+                    f_fric = f_needed * b.mass;
+                    b.debugContacts.push_back({Vec2(f_fric, 0), contact, "Static Friction"});
+                } else {
+                    f_fric = - (b.vx > 0 ? 1 : (b.vx < 0 ? -1 : 0)) * mu_dynamic * n_mag;
+                    b.debugContacts.push_back({Vec2(f_fric, 0), contact, "Kinetic Friction"});
+                }
+                forces[i].x += f_fric;
+            }
+        }
         // Left wall
-        double minX = 1e9;
-        Vec2 deepest_left;
-        for (auto& c : corners) {
-            if (c.x < minX) {
-                minX = c.x;
-                deepest_left = c;
-            }
+        double left = b.x - b.width / 2.0;
+        if (left < 0) {
+            double depth = -left;
+            double vrn = -b.vx;
+            double n_mag = spring_k * depth + damper_d * vrn;
+            if (n_mag < 0) n_mag = 0;
+            forces[i].x += n_mag;
+            Vec2 contact(0, b.y);
+            b.debugContacts.push_back({Vec2(n_mag, 0), contact, "Normal from Left Wall"});
         }
-        if (minX < 0) {
-            double depth = 0 - minX;
-            Vec2 normal(1, 0);
-            Vec2 r = deepest_left - Vec2(b.x, b.y);
-            Vec2 sep = normal * depth;
-            b.x += sep.x;
-            b.y += sep.y;
-            Vec2 perp_r(-r.y, r.x);
-            Vec2 v_at = Vec2(b.vx, b.vy) + perp_r * b.angularVelocity;
-            double vrn = v_at.dot(normal);
-            if (vrn < 0) {
-                double cross_rn = r.cross(normal);
-                double denom = 1.0 / b.mass + (cross_rn * cross_rn) / b.inertia;
-                if (denom > 0) {
-                    double j = - (1 + restitution) * vrn / denom;
-                    Vec2 impulse = normal * j;
-                    b.vx += impulse.x / b.mass;
-                    b.vy += impulse.y / b.mass;
-                    b.angularVelocity += r.cross(impulse) / b.inertia;
-                }
-            }
-        }
-
         // Right wall
-        double maxX = -1e9;
-        Vec2 deepest_right;
-        for (auto& c : corners) {
-            if (c.x > maxX) {
-                maxX = c.x;
-                deepest_right = c;
-            }
-        }
-        if (maxX > WINDOW_WIDTH) {
-            double depth = maxX - WINDOW_WIDTH;
-            Vec2 normal(-1, 0);
-            Vec2 r = deepest_right - Vec2(b.x, b.y);
-            Vec2 sep = normal * depth;
-            b.x += sep.x;
-            b.y += sep.y;
-            Vec2 perp_r(-r.y, r.x);
-            Vec2 v_at = Vec2(b.vx, b.vy) + perp_r * b.angularVelocity;
-            double vrn = v_at.dot(normal);
-            if (vrn < 0) {
-                double cross_rn = r.cross(normal);
-                double denom = 1.0 / b.mass + (cross_rn * cross_rn) / b.inertia;
-                if (denom > 0) {
-                    double j = - (1 + restitution) * vrn / denom;
-                    Vec2 impulse = normal * j;
-                    b.vx += impulse.x / b.mass;
-                    b.vy += impulse.y / b.mass;
-                    b.angularVelocity += r.cross(impulse) / b.inertia;
-                }
-            }
-        }
-
-        // Apply friction if on floor
-        if (floorCollided) {
-            if (std::abs(b.vy) > 0.1) {
-                // Already handled bounce in impulse
-            } else {
-                b.vy = 0;
-            }
-            double frictionFactor = 1.0 - std::min(1.0, friction * dt);
-            if (std::abs(b.vx) > 0.1) {
-                b.angularVelocity = -b.vx * 0.05;
-            }
-            b.vx *= frictionFactor;
-            b.angularVelocity *= 0.98;
+        double right = b.x + b.width / 2.0;
+        if (right > WINDOW_WIDTH) {
+            double depth = right - WINDOW_WIDTH;
+            double vrn = b.vx;
+            double n_mag = spring_k * depth + damper_d * vrn;
+            if (n_mag < 0) n_mag = 0;
+            forces[i].x -= n_mag;
+            Vec2 contact(WINDOW_WIDTH, b.y);
+            b.debugContacts.push_back({Vec2(-n_mag, 0), contact, "Normal from Right Wall"});
         }
     }
 
-    // Box-to-box collisions
+    // Box-to-box contacts
     for (size_t i = 0; i < boxes.size(); ++i) {
         for (size_t j = i + 1; j < boxes.size(); ++j) {
             Box &b1 = boxes[i];
             Box &b2 = boxes[j];
-            Vec2 normal;
-            double depth;
-            Vec2 contact;
-            if (checkCollision(b1, b2, normal, depth, contact)) {
-                // Position correction
-                double totalMass = b1.mass + b2.mass;
-                double frac1 = (totalMass > 0) ? b2.mass / totalMass : 0.5;
-                double frac2 = (totalMass > 0) ? b1.mass / totalMass : 0.5;
-                Vec2 sep = normal * (depth + 0.1);
-                b1.x -= sep.x * frac1;
-                b1.y -= sep.y * frac1;
-                b2.x += sep.x * frac2;
-                b2.y += sep.y * frac2;
 
-                // Impulse
-                Vec2 r1 = contact - Vec2(b1.x, b1.y);
-                Vec2 r2 = contact - Vec2(b2.x, b2.y);
-                Vec2 perp_r1(-r1.y, r1.x);
-                Vec2 perp_r2(-r2.y, r2.x);
-                Vec2 v1_at = Vec2(b1.vx, b1.vy) + perp_r1 * b1.angularVelocity;
-                Vec2 v2_at = Vec2(b2.vx, b2.vy) + perp_r2 * b2.angularVelocity;
-                Vec2 rel_vel = v1_at - v2_at;
-                double vrn = rel_vel.dot(normal);
-                if (vrn >= 0) continue;
-                double cross_r1n = r1.cross(normal);
-                double cross_r2n = r2.cross(normal);
-                double denom = 1.0 / b1.mass + 1.0 / b2.mass + (cross_r1n * cross_r1n) / b1.inertia + (cross_r2n * cross_r2n) / b2.inertia;
-                if (denom == 0) continue;
-                double j = - (1 + restitution) * vrn / denom;
-                if (j > 50) j = 50;
-                Vec2 impulse = normal * j;
-                b1.vx += impulse.x / b1.mass;
-                b1.vy += impulse.y / b1.mass;
-                b1.angularVelocity += r1.cross(impulse) / b1.inertia;
-                b2.vx -= impulse.x / b2.mass;
-                b2.vy -= impulse.y / b2.mass;
-                b2.angularVelocity += r2.cross(-impulse) / b2.inertia;
+            double left1 = b1.x - b1.width / 2.0;
+            double right1 = b1.x + b1.width / 2.0;
+            double top1 = b1.y - b1.height / 2.0;
+            double bottom1 = b1.y + b1.height / 2.0;
+
+            double left2 = b2.x - b2.width / 2.0;
+            double right2 = b2.x + b2.width / 2.0;
+            double top2 = b2.y - b2.height / 2.0;
+            double bottom2 = b2.y + b2.height / 2.0;
+
+            if (right1 < left2 || left1 > right2 || bottom1 < top2 || top1 > bottom2) continue;
+
+            double overlap_x = std::min(right1 - left2, right2 - left1);
+            double overlap_y = std::min(bottom1 - top2, bottom2 - top1);
+
+            Vec2 normal(0, 0);
+            double depth = 0;
+            if (overlap_x < overlap_y) {
+                depth = overlap_x;
+                if (b1.x < b2.x) {
+                    normal = Vec2(-1, 0);
+                } else {
+                    normal = Vec2(1, 0);
+                }
+            } else {
+                depth = overlap_y;
+                if (b1.y < b2.y) {
+                    normal = Vec2(0, -1);
+                } else {
+                    normal = Vec2(0, 1);
+                }
+            }
+
+            Vec2 rel_v = Vec2(b1.vx - b2.vx, b1.vy - b2.vy);
+            double vrn = rel_v.dot(normal);
+            double n_mag = spring_k * depth - damper_d * vrn;
+            if (n_mag < 0) n_mag = 0;
+
+            Vec2 contact((b1.x + b2.x) / 2.0, (b1.y + b2.y) / 2.0);
+
+            forces[i] += normal * n_mag;
+            forces[j] += normal * -n_mag;
+            b1.debugContacts.push_back({normal * n_mag, contact, "Normal from " + b2.label});
+            b2.debugContacts.push_back({normal * -n_mag, contact, "Normal from " + b1.label});
+
+            // Friction
+            if (n_mag > 0) {
+                Vec2 tangent(-normal.y, normal.x);
+                double vrt = rel_v.dot(tangent);
+                double mu = (std::abs(vrt) < friction_threshold) ? mu_static : mu_dynamic;
+                double f_max = mu * n_mag;
+                double f_t = -vrt * (damper_d / 10.0); // Approximate tangential damping
+                if (std::abs(f_t) > f_max) f_t = f_max * (f_t < 0 ? -1 : 1);
+                Vec2 fric = tangent * f_t;
+                forces[i] += fric;
+                forces[j] += -fric;
+                b1.debugContacts.push_back({fric, contact, "Friction from " + b2.label});
+                b2.debugContacts.push_back({-fric, contact, "Friction from " + b1.label});
             }
         }
+    }
+
+    // Integrate
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        Box &b = boxes[i];
+        Vec2 a = forces[i] / b.mass;
+        b.vx += a.x * dt;
+        b.vy += a.y * dt;
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
     }
 }
 
@@ -366,8 +265,23 @@ public:
                               120, 10, 120, 30, hwnd, (HMENU)2, NULL, NULL);
         hwndClear = CreateWindow("BUTTON", "CLEAR", WS_CHILD | WS_VISIBLE,
                                 250, 10, 100, 30, hwnd, (HMENU)3, NULL, NULL);
-        hwndDebug = CreateWindow("BUTTON", "SHOW DEBUG", WS_CHILD | WS_VISIBLE,
+        hwndDebug = CreateWindow("BUTTON", "SHOW VECTORS", WS_CHILD | WS_VISIBLE,
                                 360, 10, 120, 30, hwnd, (HMENU)4, NULL, NULL);
+
+        hwndGravityLabel = CreateWindow("STATIC", "Gravity:", WS_CHILD | WS_VISIBLE,
+                                        490, 10, 60, 30, hwnd, NULL, NULL, NULL);
+        hwndGravityEdit = CreateWindow("EDIT", "9.81", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
+                                       550, 10, 50, 30, hwnd, (HMENU)6, NULL, NULL);
+        hwndFrictionLabel = CreateWindow("STATIC", "Friction:", WS_CHILD | WS_VISIBLE,
+                                         610, 10, 60, 30, hwnd, NULL, NULL, NULL);
+        hwndFrictionEdit = CreateWindow("EDIT", "0.3", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
+                                        670, 10, 50, 30, hwnd, (HMENU)7, NULL, NULL);
+        hwndElasticityLabel = CreateWindow("STATIC", "Elasticity:", WS_CHILD | WS_VISIBLE,
+                                         730, 10, 70, 30, hwnd, NULL, NULL, NULL);
+        hwndElasticityEdit = CreateWindow("EDIT", "0.6", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
+                                        800, 10, 50, 30, hwnd, (HMENU)8, NULL, NULL);
+        hwndApply = CreateWindow("BUTTON", "Apply", WS_CHILD | WS_VISIBLE,
+                                 860, 10, 60, 30, hwnd, (HMENU)5, NULL, NULL);
 
         SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)this);
     }
@@ -390,47 +304,23 @@ public:
         RECT rect = {0, 0, width, height};
         FillRect(hdcMem, &rect, (HBRUSH)GetStockObject(WHITE_BRUSH));
 
-        // Draw floor
         RECT floorRect = {0, (int)floorY, width, height};
         FillRect(hdcMem, &floorRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
 
-        // Draw boxes
         for (auto &b : boxes) {
-            // Rotate around center
-            double cos_a = std::cos(b.angle);
-            double sin_a = std::sin(b.angle);
-            
-            double w = b.width * 0.5;
-            double h = b.height * 0.5;
-            
-            // Rotate corners
-            int corners[4][2];
-            double dxs[] = {-w, w, w, -w};
-            double dys[] = {-h, -h, h, h};
-            
-            for (int c = 0; c < 4; ++c) {
-                double rx = dxs[c] * cos_a - dys[c] * sin_a;
-                double ry = dxs[c] * sin_a + dys[c] * cos_a;
-                corners[c][0] = (int)(b.x + rx);
-                corners[c][1] = (int)(b.y + ry);
-            }
-            
+            int left = (int)(b.x - b.width / 2.0);
+            int top = (int)(b.y - b.height / 2.0);
+            int right = (int)(b.x + b.width / 2.0);
+            int bottom = (int)(b.y + b.height / 2.0);
             HBRUSH brush = CreateSolidBrush(RGB(0, 200, 255));
-            HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 100, 200));
-            HPEN oldPen = (HPEN)SelectObject(hdcMem, pen);
-            HBRUSH oldBrush = (HBRUSH)SelectObject(hdcMem, brush);
-            
-            POINT pts[4] = {{corners[0][0], corners[0][1]}, {corners[1][0], corners[1][1]}, 
-                           {corners[2][0], corners[2][1]}, {corners[3][0], corners[3][1]}};
-            Polygon(hdcMem, pts, 4);
-            
-            SelectObject(hdcMem, oldPen);
-            SelectObject(hdcMem, oldBrush);
-            DeleteObject(pen);
+            RECT boxRect = {left, top, right, bottom};
+            FillRect(hdcMem, &boxRect, brush);
+            FrameRect(hdcMem, &boxRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
             DeleteObject(brush);
+
+            TextOut(hdcMem, (int)b.x - 5, top - 15, b.label.c_str(), b.label.length());
         }
 
-        // Draw preview box
         if (addingBox == 1) {
             int x1 = (int)std::min(tempX, tempX + tempW);
             int y1 = (int)std::min(tempY, tempY + tempH);
@@ -443,47 +333,63 @@ public:
             DeleteObject(brush);
         }
 
-        // Draw debug info if enabled
-        if (showDebug) {
+        if (showVectors) {
             for (auto &b : boxes) {
-                // Center of mass (black dot)
                 HBRUSH comBrush = CreateSolidBrush(RGB(0, 0, 0));
                 SelectObject(hdcMem, comBrush);
                 Ellipse(hdcMem, (int)b.x - 3, (int)b.y - 3, (int)b.x + 3, (int)b.y + 3);
                 DeleteObject(comBrush);
+                TextOut(hdcMem, (int)b.x + 5, (int)b.y - 10, "COM", 3);
 
-                // Velocity vector (red arrow)
-                HPEN velPen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
-                SelectObject(hdcMem, velPen);
-                MoveToEx(hdcMem, (int)b.x, (int)b.y, NULL);
                 double vel_len = std::sqrt(b.vx * b.vx + b.vy * b.vy);
-                double arrow_len = std::min(50.0, vel_len * 2.0);
-                if (vel_len > 0) {
+                if (vel_len > 0.1) {
+                    double arrow_len = std::min(50.0, vel_len * 2.0);
                     double scale = arrow_len / vel_len;
-                    LineTo(hdcMem, (int)(b.x + b.vx * scale), (int)(b.y + b.vy * scale));
+                    double end_x = b.x + b.vx * scale;
+                    double end_y = b.y + b.vy * scale;
+                    HPEN velPen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
+                    SelectObject(hdcMem, velPen);
+                    MoveToEx(hdcMem, (int)b.x, (int)b.y, NULL);
+                    LineTo(hdcMem, (int)end_x, (int)end_y);
+                    TextOut(hdcMem, (int)end_x, (int)end_y, "Velocity", 8);
+                    DeleteObject(velPen);
                 }
-                DeleteObject(velPen);
 
-                // Gravity force vector (blue downward arrow)
+                double g_len = 20.0;
+                double end_x = b.x;
+                double end_y = b.y + g_len;
                 HPEN gravPen = CreatePen(PS_SOLID, 2, RGB(0, 0, 255));
                 SelectObject(hdcMem, gravPen);
                 MoveToEx(hdcMem, (int)b.x, (int)b.y, NULL);
-                double g_len = 20.0 * b.mass; // Proportional to mass, but since mass=1, fixed
-                LineTo(hdcMem, (int)b.x, (int)(b.y + g_len));
+                LineTo(hdcMem, (int)end_x, (int)end_y);
+                TextOut(hdcMem, (int)end_x, (int)end_y, "Gravity", 7);
                 DeleteObject(gravPen);
+
+                for (auto& c : b.debugContacts) {
+                    double f_len = c.force.length();
+                    if (f_len > 0.1) {
+                        Vec2 dir = c.force.normalized();
+                        double draw_len = std::min(50.0, f_len / 100.0); // Scale down since forces can be large
+                        Vec2 end = c.point + dir * draw_len;
+                        HPEN contactPen = CreatePen(PS_SOLID, 2, RGB(0, 255, 0));
+                        SelectObject(hdcMem, contactPen);
+                        MoveToEx(hdcMem, (int)c.point.x, (int)c.point.y, NULL);
+                        LineTo(hdcMem, (int)end.x, (int)end.y);
+                        TextOut(hdcMem, (int)end.x, (int)end.y, c.label.c_str(), c.label.length());
+                        DeleteObject(contactPen);
+                    }
+                }
             }
         }
 
-        // Draw info text
         SetBkMode(hdcMem, TRANSPARENT);
         SetTextColor(hdcMem, RGB(0, 0, 0));
         if (addBoxModeEnabled) {
-            TextOut(hdcMem, 490, 20, "BOX MODE: Click & drag to add | Space: pause | C: clear", 54);
+            TextOut(hdcMem, 930, 20, "BOX MODE: Click & drag to add | Space: pause | C: clear", 54);
         } else {
-            TextOut(hdcMem, 490, 20, "Click ADD BOX MODE to add boxes | Space: pause | C: clear", 57);
+            TextOut(hdcMem, 930, 20, "Click ADD BOX MODE to add boxes | Space: pause | C: clear", 57);
         }
 
-        // Blit to screen
         BitBlt(hdc, 0, BUTTON_HEIGHT, width, height - BUTTON_HEIGHT,
                hdcMem, 0, BUTTON_HEIGHT, SRCCOPY);
     }
@@ -516,8 +422,17 @@ public:
                 } else if (LOWORD(wParam) == 3) {
                     boxes.clear();
                 } else if (LOWORD(wParam) == 4) {
-                    showDebug = !showDebug;
-                    SetWindowText(hwndDebug, showDebug ? "HIDE DEBUG" : "SHOW DEBUG");
+                    showVectors = !showVectors;
+                    SetWindowText(hwndDebug, showVectors ? "HIDE VECTORS" : "SHOW VECTORS");
+                } else if (LOWORD(wParam) == 5) {
+                    char buf[32];
+                    GetWindowText(hwndGravityEdit, buf, 32);
+                    gravity = atof(buf);
+                    GetWindowText(hwndFrictionEdit, buf, 32);
+                    mu_static = mu_dynamic = atof(buf);
+                    GetWindowText(hwndElasticityEdit, buf, 32);
+                    restitution = atof(buf);
+                    damper_d = 300.0 * (1.0 - restitution);
                 }
                 return 0;
 
@@ -569,7 +484,7 @@ public:
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    Window window(WINDOW_WIDTH, WINDOW_HEIGHT, "Box Physics Simulator");
+    Window window(WINDOW_WIDTH, WINDOW_HEIGHT, "Free Body Diagram Simulator");
 
     MSG msg = {};
     while (msg.message != WM_QUIT) {
@@ -579,7 +494,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         } else {
             double dt = window.getDeltaTime();
             if (!paused) {
-                simulate(dt);
+                // Substeps for stability
+                int substeps = 4;
+                double sub_dt = dt / substeps;
+                for (int s = 0; s < substeps; ++s) {
+                    simulate(sub_dt);
+                }
             }
             window.render();
             Sleep(16);
