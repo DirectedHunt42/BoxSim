@@ -110,19 +110,35 @@ class BoxItem(QGraphicsRectItem):
         return round(angle / 15) * 15
 
     def draw_force_vector(self, painter, force, label):
-        if force.manhattanLength() == 0:
+        magnitude = math.hypot(force.x(), force.y())
+        if magnitude == 0:
             return
+
         center = self.boundingRect().center()
-        scale = 0.1  # Adjust scale for visualization
-        end = center + force * scale
+        direction = force / magnitude
+        length = max(12.0, min(120.0, magnitude * 0.15))
+        end = center + direction * length
+
+        if label == "Gravity":
+            color = Qt.blue
+        elif "Normal" in label:
+            color = Qt.darkGreen
+        elif "Contact" in label:
+            color = Qt.red
+        else:
+            color = Qt.darkYellow
+
+        painter.setPen(QPen(color, 2))
         painter.drawLine(center, end)
-        angle = math.atan2(force.y(), force.x())
-        arrow_size = 10
+
+        angle = math.atan2(direction.y(), direction.x())
+        arrow_size = max(6.0, min(16.0, length * 0.2))
         arrow1 = end - QPointF(arrow_size * math.cos(angle - math.pi / 6), arrow_size * math.sin(angle - math.pi / 6))
         arrow2 = end - QPointF(arrow_size * math.cos(angle + math.pi / 6), arrow_size * math.sin(angle + math.pi / 6))
         painter.drawLine(end, arrow1)
         painter.drawLine(end, arrow2)
         painter.drawText(end, label)
+        painter.setPen(QPen(Qt.black))
 
     # Helper to get world corners for collision math
     def get_corners(self):
@@ -233,6 +249,10 @@ class MainWindow(QMainWindow):
 
     def simulate_step(self):
         dt = 0.016
+        scene_rect = self.scene.sceneRect()
+        left_x = scene_rect.left()
+        right_x = scene_rect.right()
+        ceiling_y = scene_rect.top()
 
         # Reset forces/accelerations
         for box in self.boxes:
@@ -243,24 +263,53 @@ class MainWindow(QMainWindow):
             gravity_force = QPointF(0, box.mass_ * BoxItem.gravity)
             box.apply_force(gravity_force, "Gravity")
 
-        # Handle floor collisions
+        # Handle floor, wall, and ceiling collisions
         for box in self.boxes:
-            # Project box bottom to world
             corners = box.get_corners()
+            min_x = min(p.x() for p in corners)
+            max_x = max(p.x() for p in corners)
             min_y = min(p.y() for p in corners)
             max_y = max(p.y() for p in corners)
-            penetration = max_y - self.floor_y
-            if penetration > 0:
-                # Normal force counters gravity, but for impulse, resolve velocity
+
+            floor_penetration = max_y - self.floor_y
+            if floor_penetration > 0:
                 rel_vel = box.velocity.y()  # Assuming floor horizontal
                 if rel_vel > 0:  # Moving down
                     impulse = -(1 + self.restitution) * rel_vel * box.mass_
-                    normal_force_approx = QPointF(0, -box.mass_ * BoxItem.gravity)  # For display
-                    box.apply_force(normal_force_approx, "Normal")
-                    # Apply impulse to velocity
+                    normal_force_approx = QPointF(0, -box.mass_ * BoxItem.gravity)
+                    box.apply_force(normal_force_approx, "Floor Normal")
                     box.velocity += QPointF(0, impulse / box.mass_)
-                # Separate
-                box.setPos(box.pos() + QPointF(0, -penetration))
+                box.setPos(box.pos() + QPointF(0, -floor_penetration))
+
+            ceiling_penetration = ceiling_y - min_y
+            if ceiling_penetration > 0:
+                rel_vel = box.velocity.y()
+                if rel_vel < 0:  # Moving up
+                    impulse = -(1 + self.restitution) * rel_vel * box.mass_
+                    normal_force_approx = QPointF(0, box.mass_ * BoxItem.gravity)
+                    box.apply_force(normal_force_approx, "Ceiling Normal")
+                    box.velocity += QPointF(0, impulse / box.mass_)
+                box.setPos(box.pos() + QPointF(0, ceiling_penetration))
+
+            left_penetration = left_x - min_x
+            if left_penetration > 0:
+                rel_vel = box.velocity.x()
+                if rel_vel < 0:  # Moving left
+                    impulse = -(1 + self.restitution) * rel_vel * box.mass_
+                    normal_force_approx = QPointF(box.mass_ * BoxItem.gravity, 0)
+                    box.apply_force(normal_force_approx, "Left Wall Normal")
+                    box.velocity += QPointF(impulse / box.mass_, 0)
+                box.setPos(box.pos() + QPointF(left_penetration, 0))
+
+            right_penetration = max_x - right_x
+            if right_penetration > 0:
+                rel_vel = box.velocity.x()
+                if rel_vel > 0:  # Moving right
+                    impulse = -(1 + self.restitution) * rel_vel * box.mass_
+                    normal_force_approx = QPointF(-box.mass_ * BoxItem.gravity, 0)
+                    box.apply_force(normal_force_approx, "Right Wall Normal")
+                    box.velocity += QPointF(impulse / box.mass_, 0)
+                box.setPos(box.pos() + QPointF(-right_penetration, 0))
 
         # Handle box-box collisions
         for i in range(len(self.boxes)):
