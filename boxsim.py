@@ -2,7 +2,7 @@ import sys
 import math
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QToolBar, QGraphicsView, QGraphicsScene,
-    QGraphicsRectItem, QPushButton, QSlider, QLineEdit, QLabel
+    QGraphicsRectItem, QPushButton, QSlider, QLineEdit
 )
 from PyQt5.QtCore import QTimer, QPointF, Qt, QRectF
 from PyQt5.QtGui import QBrush, QPen, QPainter
@@ -110,36 +110,19 @@ class BoxItem(QGraphicsRectItem):
         return round(angle / 15) * 15
 
     def draw_force_vector(self, painter, force, label):
-        magnitude = math.hypot(force.x(), force.y())
-        if magnitude == 0:
+        if force.manhattanLength() == 0:
             return
-
         center = self.boundingRect().center()
-        direction = force / magnitude
-        length = max(12.0, min(120.0, magnitude * 0.15))
-        end = center + direction * length
-
-        if label == "Gravity":
-            color = Qt.blue
-        elif "Normal" in label:
-            color = Qt.darkGreen
-        elif "Contact" in label:
-            color = Qt.red
-        else:
-            color = Qt.darkYellow
-
-        pen = QPen(color, 2)
-        painter.setPen(pen)
+        scale = 0.1  # Adjust scale for visualization
+        end = center + force * scale
         painter.drawLine(center, end)
-
-        angle = math.atan2(direction.y(), direction.x())
-        arrow_size = max(6.0, min(16.0, length * 0.2))
+        angle = math.atan2(force.y(), force.x())
+        arrow_size = 10
         arrow1 = end - QPointF(arrow_size * math.cos(angle - math.pi / 6), arrow_size * math.sin(angle - math.pi / 6))
         arrow2 = end - QPointF(arrow_size * math.cos(angle + math.pi / 6), arrow_size * math.sin(angle + math.pi / 6))
         painter.drawLine(end, arrow1)
         painter.drawLine(end, arrow2)
         painter.drawText(end, label)
-        painter.setPen(QPen(Qt.black))
 
     # Helper to get world corners for collision math
     def get_corners(self):
@@ -177,31 +160,21 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(toggle_forces)
         toggle_forces.clicked.connect(self.toggle_forces)
 
-        toolbar.addWidget(QLabel("Gravity"))
         gravity_slider = QSlider(Qt.Horizontal)
         gravity_slider.setRange(0, 200)
         gravity_slider.setValue(98)
         toolbar.addWidget(gravity_slider)
-        self.gravity_slider = gravity_slider
 
         self.gravity_edit = QLineEdit("9.8")
-        self.gravity_edit.setFixedWidth(50)
         toolbar.addWidget(self.gravity_edit)
 
         gravity_slider.valueChanged.connect(self.update_gravity_from_slider)
         self.gravity_edit.textChanged.connect(self.update_gravity_from_edit)
 
-        toolbar.addWidget(QLabel("Dampen"))
-        self.dampen_slider = QSlider(Qt.Horizontal)
-        self.dampen_slider.setRange(0, 100)
-        self.dampen_slider.setValue(50)
-        self.dampen_slider.setToolTip("Collision dampening: 0 = very bouncy, 100 = no bounce")
-        toolbar.addWidget(self.dampen_slider)
-
         self.scene = QGraphicsScene(self)
+        self.scene.setSceneRect(0, 0, 800, 600)  # Set bounds
         self.view = QGraphicsView(self.scene, self)
         self.setCentralWidget(self.view)
-        self.update_scene_bounds()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.simulate_step)
@@ -209,22 +182,8 @@ class MainWindow(QMainWindow):
 
         self.next_label_index = 0
         self.boxes = []
-        self.damping = self.dampen_slider.value() / 100.0
-        self.dampen_slider.valueChanged.connect(self.update_damping)
-
-    def update_scene_bounds(self):
-        viewport_rect = self.view.viewport().rect()
-        self.scene.setSceneRect(0, 0, viewport_rect.width(), viewport_rect.height())
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.update_scene_bounds()
-
-    def update_damping(self, val):
-        self.damping = val / 100.0
-
-    def effective_restitution(self):
-        return max(0.0, min(1.0, 1.0 - self.damping))
+        self.floor_y = 500  # Floor position
+        self.restitution = 0.5  # Bounciness
 
     def update_gravity_from_slider(self, val):
         g = val / 10.0
@@ -234,7 +193,9 @@ class MainWindow(QMainWindow):
     def update_gravity_from_edit(self, text):
         try:
             g = float(text)
-            self.gravity_slider.setValue(int(g * 10))
+            slider = self.findChild(QSlider)
+            if slider:
+                slider.setValue(int(g * 10))
             BoxItem.gravity = g
         except ValueError:
             pass
@@ -262,7 +223,7 @@ class MainWindow(QMainWindow):
             label = chr(ord('A') + (self.next_label_index % 26)) + str(self.next_label_index // 26)
         self.next_label_index += 1
 
-        box = BoxItem(label, 1.0, 20, 20, 50, 50)
+        box = BoxItem(label, 1.0, 0, 0, 50, 50)
         self.scene.addItem(box)
         self.boxes.append(box)
 
@@ -272,12 +233,6 @@ class MainWindow(QMainWindow):
 
     def simulate_step(self):
         dt = 0.016
-        restitution = self.effective_restitution()
-        bounds = self.scene.sceneRect()
-        left_x = bounds.left()
-        right_x = bounds.right()
-        top_y = bounds.top()
-        bottom_y = bounds.bottom()
 
         # Reset forces/accelerations
         for box in self.boxes:
@@ -288,49 +243,24 @@ class MainWindow(QMainWindow):
             gravity_force = QPointF(0, box.mass_ * BoxItem.gravity)
             box.apply_force(gravity_force, "Gravity")
 
-        # Handle scene boundary collisions (left/right walls, ceiling, floor)
+        # Handle floor collisions
         for box in self.boxes:
+            # Project box bottom to world
             corners = box.get_corners()
-            min_x = min(p.x() for p in corners)
-            max_x = max(p.x() for p in corners)
             min_y = min(p.y() for p in corners)
             max_y = max(p.y() for p in corners)
-
-            floor_penetration = max_y - bottom_y
-            if floor_penetration > 0:
-                rel_vel = box.velocity.y()
-                if rel_vel > 0:
-                    impulse = -(1 + restitution) * rel_vel * box.mass_
+            penetration = max_y - self.floor_y
+            if penetration > 0:
+                # Normal force counters gravity, but for impulse, resolve velocity
+                rel_vel = box.velocity.y()  # Assuming floor horizontal
+                if rel_vel > 0:  # Moving down
+                    impulse = -(1 + self.restitution) * rel_vel * box.mass_
+                    normal_force_approx = QPointF(0, -box.mass_ * BoxItem.gravity)  # For display
+                    box.apply_force(normal_force_approx, "Normal")
+                    # Apply impulse to velocity
                     box.velocity += QPointF(0, impulse / box.mass_)
-                box.apply_force(QPointF(0, -box.mass_ * BoxItem.gravity), "Floor Normal")
-                box.setPos(box.pos() + QPointF(0, -floor_penetration))
-
-            ceiling_penetration = top_y - min_y
-            if ceiling_penetration > 0:
-                rel_vel = box.velocity.y()
-                if rel_vel < 0:
-                    impulse = -(1 + restitution) * rel_vel * box.mass_
-                    box.velocity += QPointF(0, impulse / box.mass_)
-                box.apply_force(QPointF(0, box.mass_ * BoxItem.gravity), "Ceiling Normal")
-                box.setPos(box.pos() + QPointF(0, ceiling_penetration))
-
-            left_penetration = left_x - min_x
-            if left_penetration > 0:
-                rel_vel = box.velocity.x()
-                if rel_vel < 0:
-                    impulse = -(1 + restitution) * rel_vel * box.mass_
-                    box.velocity += QPointF(impulse / box.mass_, 0)
-                box.apply_force(QPointF(box.mass_ * BoxItem.gravity, 0), "Left Wall Normal")
-                box.setPos(box.pos() + QPointF(left_penetration, 0))
-
-            right_penetration = max_x - right_x
-            if right_penetration > 0:
-                rel_vel = box.velocity.x()
-                if rel_vel > 0:
-                    impulse = -(1 + restitution) * rel_vel * box.mass_
-                    box.velocity += QPointF(impulse / box.mass_, 0)
-                box.apply_force(QPointF(-box.mass_ * BoxItem.gravity, 0), "Right Wall Normal")
-                box.setPos(box.pos() + QPointF(-right_penetration, 0))
+                # Separate
+                box.setPos(box.pos() + QPointF(0, -penetration))
 
         # Handle box-box collisions
         for i in range(len(self.boxes)):
@@ -351,7 +281,7 @@ class MainWindow(QMainWindow):
                         continue  # Separating
                     # Impulse scalar
                     reduced_mass = 1 / (1 / box1.mass_ + 1 / box2.mass_)
-                    impulse_scalar = -(1 + restitution) * vel_along_normal * reduced_mass
+                    impulse_scalar = -(1 + self.restitution) * vel_along_normal * reduced_mass
                     impulse = normal * impulse_scalar
                     # Apply
                     box1.velocity -= impulse / box1.mass_
